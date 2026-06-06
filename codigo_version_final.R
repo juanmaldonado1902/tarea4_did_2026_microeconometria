@@ -1,187 +1,280 @@
 # Script tarea 4
 # Creada por: Juan Pablo Maldonado 
+# Revisada y editada por: Arturo Aguilar
 
 rm(list=ls())
-library(data.table); library(stringr); library(ggplot2); library(fixest); library(did)
+library(data.table) 
+library(stringr) 
+library(ggplot2) 
+library(fixest) 
+library(did)
+library(dplyr)
+library(tidyr)
+library(didimputation)
 
 # lectura, definición de los años del panel e identificación columnas, tratamiento anual y mortalidad anual.
-wide <- fread("all_jails_ready_wide.csv"); years <- 2008:2019
+wide <- read.csv("all_jails_ready_wide.csv") 
+wide <- as.data.table(wide)
+years <- 2008:2019
+
 idc <- intersect(c("id","jail","state","county","fips","statecode"), names(wide))
-tc <- intersect(paste0("treated_", years), names(wide)); mc <- intersect(paste0("mortality_rate_", years), names(wide))
+tc <- intersect(paste0("treated_", years), names(wide)) 
+mc <- intersect(paste0("mortality_rate_", years), names(wide))
 
 #Conversión a long generando private_provider a partir de treated_año
 # Extrae el año del nombre de la columna y convierte el tratamiento a numérico hace lo mismo para moratlity_rate 
 #Panel unifica el tratamiento y mortalidad 
-t <- melt(wide,id.vars=idc,measure.vars=tc,variable.name="v",value.name="private_provider")
-t[,`:=`(year=as.numeric(str_extract(v,"\\d{4}")),v=NULL,private_provider=as.numeric(private_provider))]
-r <- melt(wide,id.vars="id",measure.vars=mc,variable.name="v",value.name="mortality_rate")
-r[,`:=`(year=as.numeric(str_extract(v,"\\d{4}")),v=NULL,mortality_rate=as.numeric(mortality_rate))]
-panel <- merge(t,r,by=c("id","year"),all.x=TRUE); setorder(panel,id,year)
+t <- wide %>%
+  select(all_of(c(idc, tc))) %>%
+  pivot_longer(cols = all_of(tc),names_to = "variable",
+               values_to = "treated") %>%
+  mutate(year = as.numeric(str_extract(variable, "\\d{4}"))) %>%
+  select(-variable)
+
+r <- wide %>%
+  select(id, all_of(mc)) %>%
+  pivot_longer(cols = all_of(mc),names_to = "variable",
+               values_to = "mortality_rate") %>%
+  mutate(year = as.numeric(str_extract(variable, "\\d{4}"))) %>%
+  select(-variable)
+
+panel <- t %>%
+  left_join(r, by = c("id", "year")) %>%
+  arrange(id, year)
 
 # Guardado e impresión de la base panel long 
-fwrite(panel,"jails_panel_long.csv")
-cat("Base panel long guardada como: jails_panel_long.csv\n")
+write.csv(panel,file="jails_panel_long.csv")
 print(head(panel,20))
 
 # Resume cada cárcel: años privados, años públicos, primer año tratado, último año tratado y secuencia de tratamiento.
-cj <- panel[,.(jail=first(jail),state=first(state),county=first(county),
-               nobs=sum(!is.na(private_provider)),npriv=sum(private_provider==1,na.rm=TRUE),npub=sum(private_provider==0,na.rm=TRUE),
-               first_treat=ifelse(any(private_provider==1,na.rm=TRUE),min(year[private_provider==1],na.rm=TRUE),0),
-               last_treat=ifelse(any(private_provider==1,na.rm=TRUE),max(year[private_provider==1],na.rm=TRUE),0),
-               first_public=ifelse(any(private_provider==0,na.rm=TRUE),min(year[private_provider==0],na.rm=TRUE),0),
-               last_public=ifelse(any(private_provider==0,na.rm=TRUE),max(year[private_provider==0],na.rm=TRUE),0),
-               seq=paste(ifelse(is.na(private_provider),"NA",private_provider),collapse="")),by=id]
+cj <- panel %>% group_by(id) %>%
+  summarise(jail = first(jail),
+            state  = first(state),
+            county = first(county),
+            nobs  = sum(!is.na(treated)),
+            npriv = sum(treated == 1, na.rm = TRUE), 
+            npub  = sum(treated == 0, na.rm = TRUE),
+            first_treat = if (any(treated == 1, na.rm = TRUE)) 
+              min(year[treated == 1], na.rm = TRUE) else 0,
+            last_treat = if (any(treated == 1, na.rm = TRUE))
+            max(year[treated == 1], na.rm = TRUE) else 0,
+            first_public = if (any(treated == 0, na.rm = TRUE))
+            min(year[treated == 0], na.rm = TRUE) else 0,
+            last_public = if (any(treated == 0, na.rm = TRUE))
+            max(year[treated == 0], na.rm = TRUE) else 0,
+            seq = paste(coalesce(as.character(treated), "NA"),
+                collapse = ""),
+            .groups = "drop")
 
 #Clasificacion de las carceles
-cj[,TreatmentStatus:=fifelse(nobs==0,"Missing",fifelse(npriv>0 & npub==0,"Always",fifelse(npriv==0 & npub>0,"Never","Switch")))]
-cj[,UnitExitsTreatment:=as.numeric(TreatmentStatus=="Switch" & (first_treat<first_public | last_treat<last_public))]
-cj[,switcher_clean:=as.numeric(TreatmentStatus=="Switch" & UnitExitsTreatment==0)]
-cj[,analytic_switcher_clean:=as.numeric(switcher_clean==1 & !(id %in% c(356,462)))]
+cj <- cj %>%
+  mutate(TreatmentStatus = case_when(nobs == 0 ~ "Missing",
+                                     npriv > 0 & npub == 0 ~ "Always",
+                                     npriv == 0 & npub > 0 ~ "Never",      
+                                     TRUE ~ "Switch"),  
+         UnitExitsTreatment = as.numeric(TreatmentStatus == "Switch" &  
+                                           (first_treat < first_public | last_treat < last_public)),  
+         switcher_clean = as.numeric(TreatmentStatus == "Switch" &
+                                       UnitExitsTreatment == 0),
+         analytic_switcher_clean = as.numeric(switcher_clean == 1 &    
+                                                !(id %in% c(356, 462))))
 
-# Pa es la muesta base de comparables (never y switcherclean)
-panel <- merge(panel,cj[,.(id,TreatmentStatus,UnitExitsTreatment,switcher_clean,analytic_switcher_clean,first_treat)],by="id",all.x=TRUE)
-pa <- panel[TreatmentStatus=="Never" | analytic_switcher_clean==1]
+# Panel es la muesta base de comparables (never y switcherclean)
+panel <- panel %>%
+  left_join(cj %>% select(id,TreatmentStatus,UnitExitsTreatment,
+                          switcher_clean,analytic_switcher_clean,
+                          first_treat),by = "id") %>%
+  filter(TreatmentStatus == "Never" | analytic_switcher_clean == 1)
 
 #Impresión de los datos pedidos y anotados en la pregunta 1
-print(table(cj$TreatmentStatus)); print(table(cj[TreatmentStatus=="Switch"]$UnitExitsTreatment))
-print(cj[switcher_clean==1,uniqueN(id)]); print(cj[analytic_switcher_clean==1,uniqueN(id)])
-print(cj[id %in% c(181,356,462),.(id,jail,state,county,TreatmentStatus,UnitExitsTreatment,switcher_clean,analytic_switcher_clean,seq)])
+print(table(cj$TreatmentStatus)) 
+print(table(cj$UnitExitsTreatment[cj$TreatmentStatus=="Switch"]))
 
-# Generación tabla por año de privatización
-tabla1 <- cj[analytic_switcher_clean==1,.N,by=first_treat][order(first_treat)]
-setnames(tabla1,c("Primer año de tratamiento","Número de cárceles")); print(tabla1)
+# ====/// 1b: Tabla y grafica de año de privatizacion \\\=====
 
-# Gráfica la distribución de este resultado
-p1 <- ggplot(tabla1,aes(`Primer año de tratamiento`,`Número de cárceles`))+
-  geom_col(fill="gray35")+theme_classic(base_size=13)+scale_x_continuous(breaks=years)+
-  labs(title="Número de cárceles switcher-clean por año de privatización",x="Primer año de tratamiento",y="Número de cárceles")
-print(p1)
+# Tabla por año de privatización
+tabla1 <- cj %>%
+  filter(analytic_switcher_clean == 1) %>%
+  count(first_treat, name = "N") %>%
+  arrange(first_treat)
+setnames(tabla1,c("Primer año de tratamiento","Número de cárceles")) 
+print(tabla1)
 
-# Esta es la parte de la replicación de la figura, la cual es establecida con Callaway/SA
-cs_fig3 <- pa[!is.na(mortality_rate)]
-cs_fig3[, g := fifelse(analytic_switcher_clean==1, first_treat, 0)]
+# Gráfica la distribución
+ggplot(tabla1,aes(`Primer año de tratamiento`,`Número de cárceles`)) +
+  geom_col(fill="gray35") +
+  theme_classic(base_size=13) +
+  scale_x_continuous(breaks=years) +
+  labs(title="Número de cárceles switcher-clean por año de privatización",
+       x="Primer año de tratamiento",
+       y="Número de cárceles")
+
+ggsave("Grafica_1b.png",  width = 5.54, height = 4.95)
+
+
+# ====/// 2: DiD 2x2 con 2008 y 2015 \\\=====
+did <- panel %>% filter(year %in% c(2008, 2015)) %>%  
+  group_by(id) %>%
+  filter(n_distinct(year[!is.na(mortality_rate)]) == 2) %>%
+  ungroup() %>%
+  mutate(treated_group = as.numeric(analytic_switcher_clean == 1 & first_treat <= 2015),    
+         post = as.numeric(year == 2015),   
+         did = treated_group * post)
+
+did_2x2 <- did %>%
+  mutate(grupo = if_else(treated_group == 1,
+                         "Tratados: privatizan antes de 2015",
+                         "Control: never-treated"),    
+         periodo = if_else(post == 1,"Post: 2015","Pre: 2008")) %>%
+  group_by(grupo, periodo) %>%
+  summarise(media_mortalidad = mean(mortality_rate, na.rm = TRUE),    
+            n_obs = sum(!is.na(mortality_rate)),    
+            .groups = "drop") %>%
+  arrange(grupo, periodo)
+
+(att_2x2 <- (did_2x2$media_mortalidad[did_2x2$grupo == "Tratados: privatizan antes de 2015" & did_2x2$periodo == "Post: 2015"]-
+            did_2x2$media_mortalidad[did_2x2$grupo == "Tratados: privatizan antes de 2015" & did_2x2$periodo == "Pre: 2008"])-
+            (did_2x2$media_mortalidad[did_2x2$grupo == "Control: never-treated" & did_2x2$periodo == "Post: 2015"]-
+            did_2x2$media_mortalidad[did_2x2$grupo == "Control: never-treated" & did_2x2$periodo == "Pre: 2008"]))
+(desv_est_Y = sd(did$mortality_rate[did$year==2008], na.rm=TRUE))
+(att_2x2/desv_est_Y)
+
+
+# ====/// 3: Estimacion con FE \\\=====
+
+m1 <- feols(mortality_rate~post+did|id,data=did,cluster=~id)
+
+# ====/// 5: TWFE y Event study \\\=====
+
+# Balanced panel
+all_years <- sort(unique(panel$year))
+panel <- panel %>% group_by(id) %>%
+  filter(n_distinct(year[!is.na(mortality_rate)]) == length(all_years)) %>%
+  ungroup() %>%
+  mutate(treated_group = as.numeric(analytic_switcher_clean == 1))
+
+#TWFE
+twfe <- feols(mortality_rate~treated|id+year,data=panel,cluster=~id)
+
+# Event study design
+panel <- panel %>%
+  mutate(T_time = if_else(analytic_switcher_clean == 1,
+                          year - first_treat,NA_real_))
+event_twfe <- feols(mortality_rate ~ i(T_time,ref = -1) |
+                    id + year,data = panel,cluster = ~id)
+
+png("event_study.png",  width = 1200, height = 800, res = 150)
+iplot(event_twfe,ref.line=-1,xlab="Años relativos a la privatización",ylab="ATT",
+      main="Event study",ci_level=.95); abline(h=0,lty=2)
+abline(h = 0, lty = 2)
+dev.off()
+
+
+# ====/// 6: DiD 2x2 Callaway y SantAnna \\\=====
+did_cs <- panel %>% filter(year %in% c(2012, 2015)) %>%  
+  group_by(id) %>%
+  filter(n_distinct(year[!is.na(mortality_rate)]) == 2) %>%
+  ungroup() %>%
+  filter(TreatmentStatus == "Never" | first_treat==2013) %>%
+  mutate(treated_group = as.numeric(first_treat == 2013),    
+         post = as.numeric(year == 2015),   
+         did = treated_group * post)
+
+cs_2x2 <- did_cs %>%
+  mutate(grupo = if_else(treated_group == 1,
+                         "Tratados: privatizan en 2013",
+                         "Control: never-treated"),    
+         periodo = if_else(post == 1,"Post: 2015","Pre: 2012")) %>%
+  group_by(grupo, periodo) %>%
+  summarise(media_mortalidad = mean(mortality_rate, na.rm = TRUE),    
+            n_obs = sum(!is.na(mortality_rate)),    
+            .groups = "drop") %>%
+  arrange(grupo, periodo)
+
+(att_2x2_cs <- (cs_2x2$media_mortalidad[cs_2x2$grupo == "Tratados: privatizan en 2013" & cs_2x2$periodo == "Post: 2015"]-
+                  cs_2x2$media_mortalidad[cs_2x2$grupo == "Tratados: privatizan en 2013" & cs_2x2$periodo == "Pre: 2012"])-
+    (cs_2x2$media_mortalidad[cs_2x2$grupo == "Control: never-treated" & cs_2x2$periodo == "Post: 2015"]-
+       cs_2x2$media_mortalidad[cs_2x2$grupo == "Control: never-treated" & cs_2x2$periodo == "Pre: 2012"]))
+(desv_est_Y = sd(did_cs$mortality_rate[did_cs$year==2012], na.rm=TRUE))
+(att_2x2_cs/desv_est_Y)
+
+# ====/// 8: Replicacion Figura 3 \\\=====
+
+cs_fig3 <- panel %>%
+  filter(!is.na(mortality_rate)) %>%
+  mutate(g = if_else(analytic_switcher_clean == 1, first_treat, 0))
 attgt_fig3 <- att_gt(yname="mortality_rate",tname="year",idname="id",gname="g",data=cs_fig3,      # Calcula (att(g,t)) toma never treated como grupo de comparacion
-                     panel=TRUE,allow_unbalanced_panel=TRUE,control_group="nevertreated",
+                     panel=TRUE,allow_unbalanced_panel=FALSE,control_group="nevertreated",
                      xformla=~1,clustervars="id",bstrap=TRUE,biters=500)
 dyn_fig3 <- aggte(attgt_fig3,type="dynamic",na.rm=TRUE)  # Agrega los efectos por tiempo relativo (aggte = callaway/stanna)
 print(summary(attgt_fig3)); print(summary(dyn_fig3))
 
 #Generación del event study
-fig3_cs <- ggdid(dyn_fig3,ylim=c(-4,4))+theme_classic(base_size=18)+
+ggdid(dyn_fig3,ylim=c(-4,4))+theme_classic(base_size=18)+
   geom_vline(xintercept=-0.5,linetype="dotted")+geom_hline(yintercept=0,linetype="dashed")+
   theme(legend.position="none",plot.subtitle=element_text(size=13,color="grey50",face="italic"))+
   xlab("Years Pre/Post Health Care Privatization")+ylab("ATT (Deaths per 1,000 daily inmates)")+
   ggtitle("Overall Jail Mortality",subtitle="Average Effect of Privatization by Length of Exposure")
-print(fig3_cs)
 
-dir.create("figures",showWarnings=FALSE)
-ggsave("figures/figura3_panel_superior_callaway_santanna.png",fig3_cs,width=10,height=6,dpi=300)
+ggsave("figure3_callaway_santanna.png",  width = 5.54, height = 4.95)
 
-# DID SIMPLE 2008-2015  (me quedo solo con datos que abarcan del (2008-2015) ocupa como tratados los que ya se trataron en 2015)
-did <- pa[year %in% c(2008,2015) & (TreatmentStatus=="Never" | (analytic_switcher_clean==1 & first_treat<=2015))]
-did[,`:=`(treated_group=as.numeric(analytic_switcher_clean==1 & first_treat<=2015),post=as.numeric(year==2015))]
-did[,did:=treated_group*post]
 
-did_2x2 <- did[,.(media_mortalidad=mean(mortality_rate,na.rm=TRUE),
-                  n_obs=sum(!is.na(mortality_rate)),
-                  n_carceles=uniqueN(id[!is.na(mortality_rate)])),
-               by=.(grupo=fifelse(treated_group==1,"Tratados: privatizan hasta 2015","Control: never-treated"),
-                    periodo=fifelse(post==1,"Post: 2015","Pre: 2008"))][order(grupo,periodo)]
+# ====/// 9: Borusyak \\\=====
 
-#Estimación manual
-did_2x2_wide <- dcast(did_2x2,grupo~periodo,value.var="media_mortalidad")
-did_2x2_wide[,cambio:=`Post: 2015`-`Pre: 2008`]
-att_did_simple <- did_2x2_wide[grupo=="Tratados: privatizan hasta 2015",cambio]-
-  did_2x2_wide[grupo=="Control: never-treated",cambio]
-print(did_2x2); print(did_2x2_wide)
-cat("\nATT DID simple 2008-2015 corregido:",round(att_did_simple,3),"\n")
+# ATT(2013,2015)
+bjs_fe <- feols(mortality_rate~1|id+year,data=panel %>% filter(treated==0,!is.na(mortality_rate)),cluster=~id)
 
-#Regresión para generar el cambio
-modelo_simple <- lm(mortality_rate~treated_group+post+did,data=did)
-tabla2 <- data.table(Variable=c("Intercepto","treated_group","post","treated_group × post"),
-                     Coeficiente=round(coef(summary(modelo_simple))[,1],3),
-                     `Error estándar`=round(coef(summary(modelo_simple))[,2],3),
-                     t=round(coef(summary(modelo_simple))[,3],3),
-                     `p-valor`=round(coef(summary(modelo_simple))[,4],3))
-print(tabla2)
 
-#Modelo de efectos fijos por carcel y por estado, especificando la clusterización
-did[,`:=`(post2015=post,treat_post2015=did)]
-m1 <- feols(mortality_rate~post2015+treat_post2015|id,data=did,cluster=~id)
-m2 <- feols(mortality_rate~post2015+treat_post2015|state,data=did,cluster=~state)
-att_twfe <- feols(mortality_rate~private_provider|id+year,data=pa,cluster=~id)   #TWFE usando todos los años: efectos fijos de cárcel y año.
+panel <- panel %>% mutate(mortality_bjs_hat = predict(bjs_fe, newdata = panel),
+                          Treatment_eff=mortality_rate-mortality_bjs_hat)
 
-etable(m1,m2,dict=c(post2015="Dummy 2015",treat_post2015="Tratado × Post 2015"),fitstat=~n+wr2,se.below=TRUE)
-etable(m1,att_twfe,dict=c(post2015="Dummy 2015",treat_post2015="Tratado × Post 2015",private_provider="Privatización médica"),
-       headers=c("DID 2008-2015","TWFE ATT 2008-2019"),fitstat=~n+wr2,se.below=TRUE)
+ggplot(data = panel %>% filter(treated==1,year==2015, first_treat==2013), aes(x=mortality_bjs_hat)) +
+  geom_histogram(bins=20) + theme(legend.position="none") + 
+  theme_classic() + 
+  labs(title="Histograma del Y_C contrafactual (year=2015,G=2013)",
+                         x="mortalidad contrafactual")
+ggsave("Graf9a.png",  width = 5.54, height = 4.95)
 
-#creación del event sudy TWFE
-pa[,`:=`(treated_group=as.numeric(analytic_switcher_clean==1),
-         rel_year=fifelse(analytic_switcher_clean==1,year-first_treat,0))]
-event_twfe <- feols(mortality_rate~i(rel_year,treated_group,ref=-1)|id+year,data=pa,cluster=~id)
-print(summary(event_twfe))
-iplot(event_twfe,ref.line=-1,xlab="Años relativos a la privatización",ylab="Efecto estimado sobre mortality_rate",
-      main="Event study TWFE: privatización médica y mortalidad",ci_level=.95); abline(h=0,lty=2)
+summary(panel$mortality_bjs_hat[panel$treated==1 & panel$first_treat==2013 & panel$year==2015])
+(desv_est_Y <- sd(panel$mortality_bjs_hat[panel$treated==1 & panel$first_treat==2013 & panel$year==2015]))
+(att_bjs_13_15 <- mean(panel$Treatment_eff[panel$treated==1 & panel$first_treat==2013 & panel$year==2015]))
+(att_bjs_13_15/desv_est_Y)
 
-# Creación del modelo de Callaway and Santa Anna con 2013-2015
-# Usa 2012 como pre y 2015 como post, att_cs genera el calculo "manual"
-cs <- pa[(analytic_switcher_clean==1 & first_treat==2013)|TreatmentStatus=="Never"][year %in% c(2012,2015)]
-cs[,`:=`(grupo=fifelse(analytic_switcher_clean==1 & first_treat==2013,"Tratados: privatizan en 2013","Control: never-treated"),
-         periodo=fifelse(year==2012,"Pre: 2012","Post: 2015"))]
-tab_cs <- cs[,.(media_mortalidad=mean(mortality_rate,na.rm=TRUE),
-                n_obs=sum(!is.na(mortality_rate)),
-                n_carceles=uniqueN(id[!is.na(mortality_rate)])),by=.(grupo,periodo)]
-w <- dcast(tab_cs,grupo~periodo,value.var="media_mortalidad")
-w[,cambio:=`Post: 2015`-`Pre: 2012`]
-att_cs <- w[grupo=="Tratados: privatizan en 2013",cambio]-w[grupo=="Control: never-treated",cambio]
-print(tab_cs); print(w); cat("\nATT C&S (2013,2015):",round(att_cs,3),"\n")
+# Event study
+#Preparar datos
+bjs_fig3 <- panel %>% filter(!is.na(mortality_rate)) %>%
+  mutate(g = if_else(analytic_switcher_clean == 1,first_treat,0))
 
-#Borusyak (bor fit genera las estimaciones para despues construir los imputados)
-pa[,treated_now:=as.numeric(private_provider==1)]
-bor_fit <- feols(mortality_rate~1|id+year,data=pa[treated_now==0 & !is.na(mortality_rate)],cluster=~id)
-pa[,y0_hat:=predict(bor_fit,newdata=pa)]
+bjs_es <- did_imputation(data = bjs_fig3,
+                         yname = "mortality_rate",gname = "g",  
+                         tname = "year",idname = "id",  
+                         horizon = TRUE,pretrends = TRUE)
 
-# Calcula efectos individuales para las cárceles tratadas en 2013 observadas en 2015.
-b13 <- pa[analytic_switcher_clean==1 & first_treat==2013 & year==2015 & !is.na(mortality_rate) & !is.na(y0_hat)]
-b13[,att_i:=mortality_rate-y0_hat]
+bjs_es <- bjs_es %>%
+  mutate(event_time = as.numeric(term))
 
-tabla_borusyak_10 <- b13[,.(id,Yi_2015=round(mortality_rate,3),
-                            Yc_imputado_2015=round(y0_hat,3),
-                            ATT_i=round(att_i,3))]
-setorder(tabla_borusyak_10,id); print(tabla_borusyak_10)
+ggplot(bjs_es,aes(x = event_time,y = estimate)) +
+  geom_hline(yintercept = 0,linetype = "dashed") +
+  geom_vline(xintercept = -0.5,linetype = "dotted") +
+  geom_point(size = 2) + 
+  geom_errorbar(aes(ymin = conf.low,ymax = conf.high),width = .15) +
+  theme_classic(base_size = 18) +
+  labs(title="BJS Event Study Estimator", x="Years Pre/Post Privatization",
+       y="ATT")
 
-cat("\nATT Borusyak (2013,2015):",round(mean(b13$att_i),3),"\n")
-print(summary(b13$y0_hat))
+ggsave("Graf9b.png",  width = 5.54, height = 4.95)  
 
-#Generación del histograma
-p_hist <- ggplot(b13,aes(y0_hat))+geom_histogram(bins=15,fill="gray35",color="white")+
-  theme_classic(base_size=13)+
-  labs(title="Histograma del contrafactual imputado",
-       subtitle=expression(Y[i,2015]^C~"para cárceles que privatizan en 2013"),
-       x=expression(hat(Y)[i,2015]^C),y="Número de cárceles")
-print(p_hist)
 
-pa[,`:=`(rel_year=fifelse(analytic_switcher_clean==1,year-first_treat,NA_real_),
-         tau_hat=mortality_rate-y0_hat)]
-eb <- pa[analytic_switcher_clean==1 & !is.na(rel_year) & !is.na(tau_hat),
-         .(att=mean(tau_hat),se=sd(tau_hat)/sqrt(.N),
-           n_obs=.N,n_carceles=uniqueN(id)),by=rel_year][order(rel_year)]
-eb[,`:=`(ci_low=att-1.96*se,ci_high=att+1.96*se)]
-print(eb)
-
-p_eb <- ggplot(eb,aes(rel_year,att))+geom_hline(yintercept=0,linetype="dashed")+
-  geom_vline(xintercept=-1,linetype="dotted")+geom_point(size=2)+
-  geom_errorbar(aes(ymin=ci_low,ymax=ci_high),width=.15)+theme_classic(base_size=13)+
-  labs(title="Event study Borusyak: privatización médica y mortalidad",
-       x="Años relativos a la privatización",y="ATT imputado sobre mortality_rate")
-print(p_eb)
+# ====/// 10: Otro metodo \\\=====
+# Sun & Abraham, hecho por Juan P. Maldonado
 
 # SA manual replica sunab()
 # Defino g como el año de primer tratamiento para switchers y 0 para never-treated
 # e como el tiempo relativo al tratamiento 
-sa <- copy(pa[!is.na(mortality_rate)])
-sa[,`:=`(g=fifelse(analytic_switcher_clean==1,first_treat,0),e=fifelse(analytic_switcher_clean==1,year-first_treat,NA_real_))]
-
+sa <- panel %>% filter(!is.na(mortality_rate))
+sa <- sa %>%
+  mutate(g = if_else(analytic_switcher_clean == 1, first_treat, 0),
+         e = if_else(analytic_switcher_clean == 1, year - first_treat, NA_real_))
 #Para cada cohorte G calcula los períodos relativos factibles dentro del panel (ymin-G a ymax-G) 
 #Excluye e = -1 como categoría de referencia, y crea una dummy binaria por cada combinación (G, e)
 
